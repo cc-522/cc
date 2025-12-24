@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <title>圣诞粒子手势交互圣诞树（手机可运行）</title>
+  <style>
+    html,body{margin:0;height:100%;background:#06121f;overflow:hidden;}
+    canvas{display:block;touch-action:none;}
+    .hud{
+      position:fixed;left:12px;top:12px;right:12px;
+      color:#d7e7ff;font:12px/1.5 system-ui,-apple-system,Segoe UI,Roboto,"Microsoft YaHei";
+      background:rgba(0,0,0,.28);padding:10px 12px;border-radius:12px;
+      backdrop-filter: blur(6px);
+    }
+    .hud b{color:#fff}
+  </style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div class="hud">
+  <div><b>手势</b>：捏合(拇指+食指) → 粒子吸附成圣诞树；张开手掌 → 粒子爆散；握拳 → 粒子聚拢</div>
+  <div><b>提示</b>：首次打开需允许摄像头（必须 HTTPS）。</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('cv');
+  const ctx = canvas.getContext('2d');
+  let W=0,H=0,DPR=1;
+
+  function resize(){
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = innerWidth; H = innerHeight;
+    canvas.width = Math.floor(W*DPR);
+    canvas.height = Math.floor(H*DPR);
+    canvas.style.width = W+'px';
+    canvas.style.height = H+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  addEventListener('resize', resize, {passive:true});
+  resize();
+
+  // ---------- video ----------
+  const video = document.createElement('video');
+  video.playsInline = true;
+  video.muted = true;
+  video.autoplay = true;
+
+  // ---------- tree geometry ----------
+  const tree = {
+    cx: () => W*0.5,
+    topY: () => H*0.18,
+    bottomY: () => H*0.88,
+    maxHalfWidth: () => Math.min(W,H)*0.22
+  };
+  function halfWidthAtY(y){
+    const t = (y - tree.topY()) / (tree.bottomY() - tree.topY());
+    if (t<0 || t>1) return 0;
+    const base = tree.maxHalfWidth() * (0.15 + 0.85*t);
+    const scallop = 1 + 0.08*Math.sin(10*t*Math.PI) + 0.04*Math.sin(22*t*Math.PI);
+    return base * scallop;
+  }
+  function insideTree(x,y){
+    const hw = halfWidthAtY(y);
+    return hw>0 && Math.abs(x-tree.cx()) <= hw;
+  }
+  function sampleTreePoint(){
+    const t = Math.random();
+    const y = tree.topY() + t*(tree.bottomY()-tree.topY());
+    const hw = halfWidthAtY(y);
+    const x = tree.cx() + (Math.random()*2-1)*hw + 6*Math.sin(t*10*Math.PI);
+    return {x,y};
+  }
+  function drawStar(cx, cy, outerR, innerR, points){
+    ctx.beginPath();
+    let rot = -Math.PI/2;
+    const step = Math.PI/points;
+    ctx.moveTo(cx + Math.cos(rot)*outerR, cy + Math.sin(rot)*outerR);
+    for(let i=0;i<points;i++){
+      ctx.lineTo(cx + Math.cos(rot+step)*innerR, cy + Math.sin(rot+step)*innerR);
+      rot += 2*step;
+      ctx.lineTo(cx + Math.cos(rot)*outerR, cy + Math.sin(rot)*outerR);
+    }
+    ctx.closePath();
+    const g = ctx.createRadialGradient(cx,cy,2,cx,cy,outerR*1.8);
+    g.addColorStop(0,"rgba(255,245,185,1)");
+    g.addColorStop(0.5,"rgba(255,210,90,1)");
+    g.addColorStop(1,"rgba(255,210,90,0)");
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+  function drawTreeSilhouette(){
+    ctx.save();
+    // glow behind
+    const gx=tree.cx(), gy=(tree.topY()+tree.bottomY())*0.55;
+    const r=Math.min(W,H)*0.38;
+    const glow=ctx.createRadialGradient(gx,gy,10,gx,gy,r);
+    glow.addColorStop(0,"rgba(90,180,255,0.18)");
+    glow.addColorStop(0.55,"rgba(100,80,255,0.10)");
+    glow.addColorStop(1,"rgba(0,0,0,0)");
+    ctx.fillStyle=glow; ctx.fillRect(0,0,W,H);
+
+    // tree body
+    ctx.beginPath();
+    const step=6;
+    for(let y=tree.topY(); y<=tree.bottomY(); y+=step){
+      const hw=halfWidthAtY(y);
+      const xL=tree.cx()-hw;
+      if(y===tree.topY()) ctx.moveTo(xL,y); else ctx.lineTo(xL,y);
+    }
+    for(let y=tree.bottomY(); y>=tree.topY(); y-=step){
+      const hw=halfWidthAtY(y);
+      const xR=tree.cx()+hw;
+      ctx.lineTo(xR,y);
+    }
+    ctx.closePath();
+    const g=ctx.createLinearGradient(0,tree.topY(),0,tree.bottomY());
+    g.addColorStop(0,"#0c6b3a");
+    g.addColorStop(0.55,"#0b4f31");
+    g.addColorStop(1,"#083522");
+    ctx.fillStyle=g; ctx.fill();
+    ctx.strokeStyle="rgba(255,255,255,0.10)";
+    ctx.lineWidth=1.2; ctx.stroke();
+
+    // trunk
+    const trunkW=tree.maxHalfWidth()*0.35;
+    const trunkH=(tree.bottomY()-tree.topY())*0.12;
+    const tx=tree.cx()-trunkW/2;
+    const ty=tree.bottomY()-trunkH*0.55;
+    const tg=ctx.createLinearGradient(tx,0,tx+trunkW,0);
+    tg.addColorStop(0,"#6b3f1f"); tg.addColorStop(1,"#3f2311");
+    ctx.fillStyle=tg; ctx.fillRect(tx,ty,trunkW,trunkH);
+
+    // star
+    drawStar(tree.cx(), tree.topY()-18, 12, 6, 5);
+    ctx.restore();
+  }
+
+  // ---------- particles ----------
+  const palette = ["#ff4d6d","#ffd166","#06d6a0","#4dabf7","#c77dff","#ffb703","#f72585"];
+  function randColor(){
+    return palette[(Math.random()*palette.length)|0];
+  }
+
+  class Particle{
+    constructor(x,y){
+      this.x=x; this.y=y;
+      this.vx=(Math.random()*2-1)*1.5;
+      this.vy=(Math.random()*2-1)*1.5;
+      this.tx=x; this.ty=y;
+      this.life=1;
+      this.size=1.2 + Math.random()*2.2;
+      this.color = Math.random()<0.85 ? "rgba(255,200,90,1)" : randColor();
+    }
+    step(dt, mode, attractX, attractY){
+      // spring to target
+      let k = (mode==="TREE") ? 10 : (mode==="IDLE" ? 12 : 4.5);
+      let damp = (mode==="TREE") ? 0.90 : (mode==="IDLE" ? 0.88 : 0.92);
+
+      const fx = (this.tx - this.x)*k + (Math.random()*2-1)*6;
+      const fy = (this.ty - this.y)*k + 18 + (Math.random()*2-1)*6;
+
+      this.vx = (this.vx + fx*dt) * damp;
+      this.vy = (this.vy + fy*dt) * damp;
+
+      // burst extra
+      if (mode==="BURST"){
+        const dx=this.x-attractX, dy=this.y-attractY;
+        const ang=Math.atan2(dy,dx)+(Math.random()*2-1)*0.6;
+        const sp= (Math.random()*5+3);
+        this.vx += Math.cos(ang)*sp;
+        this.vy += Math.sin(ang)*sp;
+      }
+
+      this.x += this.vx*(60*dt);
+      this.y += this.vy*(60*dt);
+
+      // wrap
+      if (this.x<-20) this.x=W+20;
+      if (this.x>W+20) this.x=-20;
+      if (this.y<-40) this.y=H+40;
+      if (this.y>H+40) this.y=-40;
+    }
+    draw(){
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = this.color;
+      ctx.beginPath();
+      ctx.arc(this.x,this.y,this.size,0,Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  const particles=[];
+  const N=1600;
+  function initParticles(){
+    particles.length=0;
+    const cx=W*0.5, cy=H*0.48;
+    for(let i=0;i<N;i++){
+      particles.push(new Particle(cx+(Math.random()*2-1)*40, cy+(Math.random()*2-1)*40));
+    }
+  }
+  initParticles();
+
+  // ---------- gesture ----------
+  let mode="TREE"; // TREE | BURST | IDLE | FLOAT
+  let handX=W*0.5, handY=H*0.5;
+
+  function dist(a,b){
+    const dx=a.x-b.x, dy=a.y-b.y;
+    return Math.hypot(dx,dy);
+  }
+  function isFingerExtended(lm, tip, pip){
+    return lm[tip].y < lm[pip].y;
+  }
+  function classify(lm){
+    const pinch = dist(lm[4], lm[8]); // thumb-index
+    const extIndex  = isFingerExtended(lm,8,6);
+    const extMid    = isFingerExtended(lm,12,10);
+    const extRing   = isFingerExtended(lm,16,14);
+    const extPinky  = isFingerExtended(lm,20,18);
+    const openPalm = extIndex && extMid && extRing && extPinky && pinch > 0.07;
+    const fist = (!extIndex)&&(!extMid)&&(!extRing)&&(!extPinky) && pinch > 0.05;
+    const pinchOn = pinch < 0.045;
+    if (pinchOn) return "TREE";
+    if (openPalm) return "BURST";
+    if (fist) return "IDLE";
+    return "FLOAT";
+  }
+
+  // ---------- MediaPipe Hands ----------
+  const hands = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  hands.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+
+  hands.onResults((results) => {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length){
+      const lm = results.multiHandLandmarks[0];
+      mode = classify(lm);
+      handX = lm[8].x * W; // index tip
+      handY = lm[8].y * H;
+
+      // TREE：不断给粒子分配树内目标点
+      if (mode==="TREE"){
+        for (const p of particles){
+          if (Math.random()<0.02){
+            const t = sampleTreePoint();
+            p.tx=t.x; p.ty=t.y;
+          }
+        }
+      }
+      // IDLE：聚到手指附近
+      if (mode==="IDLE"){
+        for (const p of particles){
+          p.tx = handX; p.ty = handY;
+        }
+      }
+      // FLOAT：弱跟随
+      if (mode==="FLOAT"){
+        for (const p of particles){
+          if (Math.random()<0.01){
+            p.tx = handX + (Math.random()*2-1)*90;
+            p.ty = handY + (Math.random()*2-1)*90;
+          }
+        }
+      }
+    }
+  });
+
+  const camera = new Camera(video, {
+    onFrame: async () => {
+      await hands.send({image: video});
+    },
+    width: 640,
+    height: 480
+  });
+
+  // ---------- render loop ----------
+  let last = performance.now();
+  function drawBackground(){
+    const bg = ctx.createLinearGradient(0,0,0,H);
+    bg.addColorStop(0,"#041022");
+    bg.addColorStop(0.55,"#061a2d");
+    bg.addColorStop(1,"#020814");
+    ctx.fillStyle=bg;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  function tick(now){
+    const dt = Math.min(34, now-last)/1000;
+    last = now;
+
+    // 背景 + 相机画面（AR感更强：可调透明度）
+    drawBackground();
+    if (video.readyState >= 2){
+      // 把摄像头铺满（可改成 contain）
+      ctx.globalAlpha = 0.35;
+      ctx.drawImage(video, 0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+
+    // 树轮廓（TREE 模式更明显）
+    if (mode==="TREE") drawTreeSilhouette();
+
+    // 粒子
+    for (const p of particles){
+      p.step(dt, mode, handX, handY);
+      p.draw();
+    }
+
+    // 小提示圈
+    ctx.globalAlpha = 0.25;
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(handX, handY, 14, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    requestAnimationFrame(tick);
+  }
+
+  // start
+  (async () => {
+    try{
+      await camera.start();
+      requestAnimationFrame(tick);
+    }catch(e){
+      alert("无法打开摄像头：请确认使用 HTTPS 打开网页，并允许相机权限。\n\n" + e);
+    }
+  })();
+
+  // 双击重置
+  let lastTap=0;
+  canvas.addEventListener('touchend', ()=>{
+    const t=Date.now();
+    if (t-lastTap<300){
+      initParticles();
+    }
+    lastTap=t;
+  }, {passive:true});
+
+})();
+</script>
+</body>
+</html>
