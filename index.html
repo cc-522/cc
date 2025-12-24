@@ -1,3 +1,4 @@
+```html
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -141,13 +142,25 @@
       color: #fff;
       border-color: #fff;
     }
+
+    /* 摄像头只后台识别：完全不显示 */
+    #webcam {
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      width: 1px;
+      height: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
   </style>
 
   <script type="importmap">
     {
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+        "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
       }
     }
   </script>
@@ -168,6 +181,9 @@
     </div>
   </div>
 
+  <!-- 摄像头：只用于后台手势识别 -->
+  <video id="webcam" autoplay playsinline muted></video>
+
   <!-- 固定音乐 -->
   <audio id="bg-music" loop preload="auto" crossorigin="anonymous"></audio>
 
@@ -177,9 +193,10 @@
     import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
     import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
     import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+    import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 
     // =========================
-    // 固定资源配置（你要求的路径）
+    // 固定资源配置
     // =========================
     const ASSETS = {
       title: "Merry Christmas",
@@ -199,22 +216,26 @@
         count: 1800, dustCount: 1500, treeHeight: 28, treeRadius: 9,
         snowCount: 2500, snowSpeed: 10
       },
-      camera: { z: 55 }
+      camera: { z: 55 },
+      gesture: {
+        okPinch: 0.055,          // OK(拇指+食指)阈值
+        debounceMs: 1200,        // 手势防抖
+        minPalm: 0.10            // 手掌尺度下限（避免远距离误判）
+      }
     };
 
     const STATE = {
       mode: 'TREE',
-      focusTarget: null,
-      currentPhotoIndex: -1,
       currentThemeIndex: 0,
 
       // 固定书信
       letterContent: "",
       letterTyper: null,
       letterStartTimer: null,
+      lastLetterTrig: 0,
+      lastThemeTrig: 0,
 
       rotation: { x: 0, y: 0 },
-      spinVel: { x: 0, y: 0 },
       time: 0,
 
       starMesh: null,
@@ -227,8 +248,12 @@
 
     let caneTexture, snowTexture, heartTexture, matLib = {};
 
+    // MediaPipe
+    let handLandmarker = null;
+    let videoEl = null;
+    let lastVideoTime = -1;
+
     const _tempVec = new THREE.Vector3();
-    const _targetVec = new THREE.Vector3();
 
     function setFixedTitle() {
       document.title = ASSETS.title;
@@ -252,17 +277,15 @@
       audioEl.preload = "auto";
       audioEl.crossOrigin = "anonymous";
 
-      // 静音预热（可能被允许）
+      // 静音预热（部分浏览器允许）
       audioEl.muted = true;
-      audioEl.play().then(() => {
-        // 注意：解除静音通常仍需要用户手势，下面会处理
-      }).catch(() => {});
+      audioEl.play().catch(() => {});
 
+      // 第一次用户交互 -> 打开声音继续循环
       const startWithSound = () => {
         audioEl.muted = false;
         audioEl.play().catch(() => {});
       };
-
       window.addEventListener('pointerdown', startWithSound, { once: true });
       window.addEventListener('keydown', startWithSound, { once: true });
     }
@@ -340,6 +363,9 @@
       await loadPhotosFromManifest();
 
       switchTheme(0);
+
+      // 后台手势识别（不显示摄像头）
+      initMediaPipe().catch(console.warn);
 
       const loader = document.getElementById('loader');
       loader.style.opacity = 0;
@@ -531,11 +557,11 @@
     class Particle {
       constructor(mesh, type, isDust = false) {
         this.mesh = mesh; this.type = type; this.isDust = isDust;
-        this.posTree = new THREE.Vector3(); this.posScatter = new THREE.Vector3();
+        this.posTree = new THREE.Vector3();
         this.baseScale = mesh.scale.x;
         this.offset = Math.random() * 100;
         this.speed = 0.5 + Math.random();
-        if (mesh.material && mesh.material.emissive) { this.hasEmissive = true; }
+        this.hasEmissive = !!(mesh.material && mesh.material.emissive);
         this.calculatePositions();
       }
       calculatePositions() {
@@ -550,19 +576,10 @@
           const r = Math.max(0.5, CONFIG.particles.treeRadius * (1.0 - t)) * Math.sqrt(Math.random());
           this.posTree.set(Math.cos(angle) * r, y, Math.sin(angle) * r);
         }
-        const rScatter = this.isDust ? (15 + Math.random()*25) : (10 + Math.random()*15);
-        const theta = Math.random() * Math.PI * 2, phi = Math.acos(2 * Math.random() - 1);
-        this.posScatter.set(
-          rScatter * Math.sin(phi) * Math.cos(theta),
-          rScatter * Math.sin(phi) * Math.sin(theta),
-          rScatter * Math.cos(phi)
-        );
       }
       update(dt, time, mode) {
-        let target, s = this.baseScale, lerpSpeed = 3.0;
-
-        if (mode === 'LETTER') target = this.posScatter;
-        else target = this.posTree;
+        let target = this.posTree;
+        let s = this.baseScale, lerpSpeed = 3.0;
 
         _tempVec.copy(target);
         if(mode === 'TREE') {
@@ -641,8 +658,7 @@
       geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geometry.setAttribute('velocity', new THREE.BufferAttribute(velocities, 1));
 
-      const mat = matLib.heartFlake.clone();
-      heartSystem = new THREE.Points(geometry, mat);
+      heartSystem = new THREE.Points(geometry, matLib.heartFlake.clone());
       heartSystem.visible = false;
       bgGroup.add(heartSystem);
     }
@@ -905,37 +921,126 @@
         composer.setSize(window.innerWidth, window.innerHeight);
       });
 
-      // 双击：全屏/退出全屏
-      window.addEventListener('dblclick', () => {
-        if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
-        else document.documentElement.requestFullscreen().catch(()=>{});
-      });
-
-      // 关闭书信
+      // 只保留书信关闭按钮（你要求保留）
       document.getElementById('btn-close-letter-mode').addEventListener('click', (e) => {
         e.stopPropagation();
         exitLetterMode();
       });
+    }
 
-      // 键盘快捷键
-      window.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') {
-          if (STATE.mode === 'LETTER') exitLetterMode();
-        }
-        if (e.key === 't' || e.key === 'T') {
-          switchTheme((STATE.currentThemeIndex + 1) % 3);
-        }
-        if (e.key === 'l' || e.key === 'L') {
-          if (STATE.mode === 'LETTER') exitLetterMode();
-          else enterLetterMode();
-        }
+    // =========================
+    // 纯手势交互（无任何UI按钮）
+    // 手势定义：
+    // 1) 👍 竖拇指：切换主题（循环 3 种）
+    // 2) 👌 OK：打开书信（有内容才会打开）
+    // =========================
+    async function initMediaPipe() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1
       });
 
-      // 点击：如果你想点击也能开/关书信（可选），这里我默认不开启
-      // window.addEventListener('click', () => enterLetterMode());
+      videoEl = document.getElementById('webcam');
+
+      if (!navigator.mediaDevices?.getUserMedia) return;
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false
+      });
+
+      videoEl.srcObject = stream;
+
+      // 某些浏览器需要 loadeddata 后才能拿到 currentTime
+      videoEl.addEventListener("loadeddata", () => {
+        videoEl.play().catch(()=>{});
+        requestAnimationFrame(predictWebcam);
+      }, { once: true });
+    }
+
+    function dist(lm, i, j) {
+      return Math.hypot(lm[i].x - lm[j].x, lm[i].y - lm[j].y);
+    }
+
+    function isThumbsUp(lm) {
+      // 关键距离：掌心尺度
+      const palm = dist(lm, 0, 9);
+      if (palm < CONFIG.gesture.minPalm) return false;
+
+      const thumbExtended = dist(lm, 4, 9) > palm * 0.90;
+      const indexCurled  = dist(lm, 8, 9) < palm * 0.70;
+      const middleCurled = dist(lm, 12, 9) < palm * 0.70;
+      const ringCurled   = dist(lm, 16, 9) < palm * 0.70;
+      const pinkyCurled  = dist(lm, 20, 9) < palm * 0.70;
+
+      return thumbExtended && indexCurled && middleCurled && ringCurled && pinkyCurled;
+    }
+
+    function isOKGesture(lm) {
+      // 拇指(4)与食指(8)捏合
+      const pinch = dist(lm, 4, 8);
+      if (pinch > CONFIG.gesture.okPinch) return false;
+
+      // 同时要求中指伸出，降低误触
+      const palm = dist(lm, 0, 9);
+      if (palm < CONFIG.gesture.minPalm) return false;
+
+      const middleExtended = dist(lm, 12, 0) > palm * 1.30;
+      return middleExtended;
+    }
+
+    function processGestures(lm) {
+      if (!lm) return;
+
+      // 书信模式时，不响应主题切换/再次开信
+      if (STATE.mode === 'LETTER') return;
+
+      const now = Date.now();
+
+      // 👌 OK -> 打开书信
+      if (isOKGesture(lm)) {
+        if (STATE.letterContent && (now - STATE.lastLetterTrig > CONFIG.gesture.debounceMs)) {
+          STATE.lastLetterTrig = now;
+          enterLetterMode();
+          return;
+        }
+      }
+
+      // 👍 -> 切换主题
+      if (isThumbsUp(lm)) {
+        if (now - STATE.lastThemeTrig > CONFIG.gesture.debounceMs) {
+          STATE.lastThemeTrig = now;
+          switchTheme((STATE.currentThemeIndex + 1) % 3);
+          return;
+        }
+      }
+    }
+
+    async function predictWebcam() {
+      if (!handLandmarker || !videoEl) {
+        requestAnimationFrame(predictWebcam);
+        return;
+      }
+
+      if (lastVideoTime !== videoEl.currentTime) {
+        lastVideoTime = videoEl.currentTime;
+        const result = handLandmarker.detectForVideo(videoEl, performance.now());
+        if (result.landmarks?.[0]) processGestures(result.landmarks[0]);
+      }
+
+      requestAnimationFrame(predictWebcam);
     }
 
     init();
   </script>
 </body>
 </html>
+```
